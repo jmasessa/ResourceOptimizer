@@ -193,3 +193,176 @@ def avg_weekday_hours(avail_df: pd.DataFrame, name: str, date_cols: list[str], d
     return float(np.mean(vals)) if vals else 0.0
 
 def pick_for_role(
+    skills_df: pd.DataFrame,
+    avail_df: pd.DataFrame,
+    role: str,
+    desired_skill: str,
+    threshold_hours: float,
+    date_cols: list[str],
+    dates: list[pd.Timestamp],
+    already_chosen: set[str],
+) -> dict:
+    # Candidates = everyone with this Role
+    names = (
+        skills_df.loc[skills_df["Role"] == role, "Resource Name"]
+        .dropna().astype(str).str.strip().unique().tolist()
+    )
+    if not names:
+        return {"role": role, "chosen": None, "reason": "No candidates with this role."}
+
+    # Score each candidate
+    rows = []
+    for name in names:
+        prof = prof_for_employee_skill(skills_df, name, role, desired_skill)
+        avg_h = avg_weekday_hours(avail_df, name, date_cols, dates)
+        distance = max(0.0, threshold_hours - avg_h)  # 0 means meets threshold
+        level_label = skill_level_label(skills_df, name, role, desired_skill)  # label for output
+        rows.append({
+            "name": name,
+            "prof_score": prof,
+            "avg_weekday_hours": avg_h,
+            "distance_to_threshold": distance,
+            "skill_level": level_label,
+        })
+    cand_df = pd.DataFrame(rows)
+    if cand_df.empty:
+        return {"role": role, "chosen": None, "reason": "No candidates scored."}
+
+    # Rank:
+    # 1) prefer those meeting threshold (distance == 0)
+    # 2) higher prof_score
+    # 3) higher avg_weekday_hours
+    # If nobody meets threshold, pick closest (min distance), then prof, then hours.
+    meets = cand_df[cand_df["distance_to_threshold"] == 0.0].copy()
+    misses = cand_df[cand_df["distance_to_threshold"] > 0.0].copy()
+    meets = meets.sort_values(["prof_score", "avg_weekday_hours"], ascending=[False, False])
+    misses = misses.sort_values(["distance_to_threshold", "prof_score", "avg_weekday_hours"],
+                                ascending=[True, False, False])
+    ranked = pd.concat([meets, misses], ignore_index=True)
+
+    # Avoid duplicate people across roles: pick first not already chosen
+    for _, row in ranked.iterrows():
+        if row["name"] not in already_chosen:
+            chosen = row.to_dict()
+            chosen["met_threshold"] = (chosen["distance_to_threshold"] == 0.0)
+            chosen["desired_skill"] = desired_skill
+            return {"role": role, "chosen": chosen, "reason": ""}
+
+    # If all top picks already used, take the highest-ranked anyway
+    fallback = ranked.iloc[0].to_dict()
+    fallback["met_threshold"] = (fallback["distance_to_threshold"] == 0.0)
+    fallback["desired_skill"] = desired_skill
+    return {"role": role, "chosen": fallback, "reason": "Had to reuse because all others were already chosen."}
+
+# ---------------- Main ----------------
+def main():
+    # Load & normalize
+    skills_df, avail_df = load_inputs()
+    skills_df, avail_df, date_cols, dates = normalize_frames(skills_df, avail_df)
+
+    # Build role→skills lookup for validation
+    skills_per_role = list_skills_per_role(skills_df)
+
+    # ---- Prompts ----
+    print("\nAvailable skills by role:")
+    for r in ROLES:
+        print(f" • {r}: {', '.join(skills_per_role[r]) or '(none)'}")
+
+    designer_skill = input("\nDesired Designer Skillset: ").strip()
+    if designer_skill not in skills_per_role.get("DESIGNER", []):
+        print("✋ That skill is not listed under DESIGNER. Please re-run and choose from the list shown.")
+        sys.exit(1)
+    designer_eff   = prompt_effort("Designer Effort Level (high/med/low): ")
+
+    writer_skill   = input("\nDesired Writer Skillset: ").strip()
+    if writer_skill not in skills_per_role.get("WRITER", []):
+        print("✋ That skill is not listed under WRITER. Please re-run and choose from the list shown.")
+        sys.exit(1)
+    writer_eff     = prompt_effort("Writer Effort Level (high/med/low): ")
+
+    editor_skill   = input("\nDesired Editor Skillset: ").strip()
+    if editor_skill not in skills_per_role.get("EDITOR", []):
+        print("✋ That skill is not listed under EDITOR. Please re-run and choose from the list shown.")
+        sys.exit(1)
+    editor_eff     = prompt_effort("Editor Effort Level (high/med/low): ")
+
+    start_date     = prompt_date("\nProject Start Date (YYYY-MM-DD): ")
+    end_date       = prompt_date("Project End Date   (YYYY-MM-DD): ")
+
+    # Filter the availability columns to the selected weekday date range
+    picked_dates = restrict_dates(dates, start_date, end_date)
+    if not picked_dates:
+        print("\n✋ No weekday dates in the selected range that match your availability sheet columns.")
+        print("   Check your dates or the availability file headers.")
+        sys.exit(1)
+
+    # Subset the mapped columns for the picked dates
+    col_by_date = {d: c for c, d in zip(date_cols, dates)}
+    picked_cols = [col_by_date[d] for d in picked_dates]
+
+    # ---- Selection per role with thresholds ----
+    thresholds = {
+        "DESIGNER": EFFORT_THRESH[designer_eff],
+        "WRITER":   EFFORT_THRESH[writer_eff],
+        "EDITOR":   EFFORT_THRESH[editor_eff],
+    }
+    desired_skills = {
+        "DESIGNER": designer_skill,
+        "WRITER":   writer_skill,
+        "EDITOR":   editor_skill,
+    }
+
+    chosen = []
+    used_people = set()
+    for role in ROLES:
+        res = pick_for_role(
+            skills_df, avail_df, role, desired_skills[role], thresholds[role],
+            picked_cols, picked_dates, used_people
+        )
+        chosen.append(res)
+        if res["chosen"] and res["chosen"].get("name"):
+            used_people.add(res["chosen"]["name"])
+
+    # ---- Report ----
+    print("\n=== Selection Summary ===")
+    rows = []
+    for res in chosen:
+        role = res["role"]
+        ch   = res["chosen"]
+        if not ch:
+            print(f"{role:8s}: (no candidate)  {res.get('reason','')}")
+            rows.append({
+                "role": role, "employee": None, "desired_skill": desired_skills[role],
+                "skill_level": None, "avg_weekday_hours": None,
+                "effort_threshold": thresholds[role],
+                "met_threshold": None, "note": res.get("reason","")
+            })
+            continue
+        print(
+            f"{role:8s}: {ch['name']}  | skill='{ch['desired_skill']}' "
+            f"| level={ch.get('skill_level') or 'N/A'} "
+            f"| avg/day={ch['avg_weekday_hours']:.2f}h "
+            f"| needs≥{threshholds:=thresholds[role]:.1f} → {'OK' if ch['met_threshold'] else 'closest'} "
+            f"{('(dup-resolved)') if res.get('reason') else ''}"
+        )
+        rows.append({
+            "role": role,
+            "employee": ch["name"],
+            "desired_skill": ch["desired_skill"],
+            "skill_level": ch.get("skill_level"),
+            "avg_weekday_hours": round(float(ch["avg_weekday_hours"]), 3),
+            "effort_threshold": thresholds[role],
+            "met_threshold": bool(ch["met_threshold"]),
+            "note": res.get("reason",""),
+        })
+
+    # Save CSV
+    out_path = Path(__file__).resolve().parent / "selection_summary.csv"
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"\nWrote: {out_path}")
+
+    # Helpful context
+    print("\nDates used (weekdays):", ", ".join(d.strftime("%Y-%m-%d") for d in picked_dates))
+
+if __name__ == "__main__":
+    main()
